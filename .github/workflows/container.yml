@@ -1,0 +1,173 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+    IMAGE_TAGS: latest ${{ github.sha }}
+    TEST_IMAGE_TAG: ${{ github.sha }}
+    IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
+    REGISTRY_USER: ${{ github.actor }}
+    REGISTRY_PASSWORD: ${{ github.token }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+
+  # container:
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 20
+
+  #   outputs:
+  #     image: ${{ steps.build_image_dependencies.outputs.image}}
+  #     tags: ${{ steps.build_image_dependencies.outputs.tags}}
+
+  #   steps:
+  #   - name: Delete huge unnecessary tools folder
+  #     run: rm -rf /opt/hostedtoolcache
+
+  #   - name: Check out
+  #     if: always()
+  #     uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+  #     with:
+  #       fetch-depth: 0
+
+  #   - name: Build Image with dependencies
+  #     id: build_image_dependencies
+  #     uses: redhat-actions/buildah-build@7a95fa7ee0f02d552a32753e7414641a04307056 # v2.13
+  #     with:
+  #       image: dependencies
+  #       tags: ${{ env.IMAGE_TAGS }}
+  #       containerfiles: |
+  #         ./Dockerfile.dependencies
+
+  #   - name: Push To GHCR
+  #     uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2.8
+  #     id: push_dependencies
+  #     with:
+  #       image: ${{ steps.build_image_dependencies.outputs.image }}
+  #       tags: ${{ steps.build_image_dependencies.outputs.tags }}
+  #       registry: ${{ env.IMAGE_REGISTRY }}
+  #       username: ${{ env.REGISTRY_USER }}
+  #       password: ${{ env.REGISTRY_PASSWORD }}
+  #       extra-args: |
+  #         --disable-content-trust
+
+
+  build_trilinos:
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+      checks: write
+    # needs: container
+
+    runs-on: ubuntu-latest
+    container:
+      # image: ${{ needs.container.outputs.image }}:latest
+      image: ghcr.io/muelu/dependencies:latest
+      credentials:
+       username: ${{ github.actor }}
+       password: ${{ github.token }}
+
+    steps:
+      - name: Check out
+        if: always()
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+        with:
+          fetch-depth: 0
+
+      - name: Check out Trilinos
+        if: always()
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+        with:
+          repository: trilinos/Trilinos
+          ref: develop
+          path: Trilinos-source
+
+      - name: Check out mpi_advance
+        if: always()
+        uses: actions/checkout@eef61447b9ff4aafe5dcd4e0bbf5d482be7e7871 # v4.2.1
+        with:
+          repository: mpi-advance/locality_aware
+          ref: master
+          path: mpi-advance-source
+
+      - name: Pull ccache cache
+        if: always()
+        id: ccache-restore
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: /github/home/.cache/ccache
+          key: ccache
+
+      - name: Get ccache config dir
+        if: always()
+        run: ccache --show-config
+
+      - name: Build mpi-advance
+        run: |
+          mkdir mpi-advance-build
+          mkdir mpi-advance-install
+          cd mpi-advance-build
+          cmake -S ../mpi-advance-source -B . -D BUILD_SHARED_LIBS=ON -D CMAKE_INSTALL_PREFIX=../mpi-advance-install
+          make install
+
+      - name: Build Trilinos
+        run: |
+          mkdir Trilinos-build
+          cd Trilinos-build
+          cmake -S ../Trilinos-source -B . -C ../trilinos-build.cmake
+          NP=2 make -j 2
+          export OMPI_MCA_rmaps_base_oversubscribe=true
+          ctest --output-junit ../ctest.xml
+
+      - name: Remove ccache cache
+        if: ${{ steps.ccache-restore.outputs.cache-hit }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh extension install actions/gh-actions-cache
+          gh actions-cache delete ccache --confirm
+        continue-on-error: true
+
+      - name: Push ccache cache
+        if: always()
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: /github/home/.cache/ccache
+          key: ccache
+
+      - name: Ccache report
+        if: always()
+        run: ccache -s
+
+      - name: Archive results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: Test results
+          path: |
+            ctest.xml
+
+      - name: Report results
+        uses: dorny/test-reporter@6e6a65b7a0bd2c9197df7d0ae36ac5cee784230c # v1
+        if: always()
+        with:
+          name: Report
+          path: |
+            ctest.xml
+          reporter: java-junit
+          fail-on-error: false
+          max-annotations: 0
